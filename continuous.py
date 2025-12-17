@@ -4,16 +4,18 @@ import numpy as np
 
 
 import gymnasium as gym
-env_name="HalfCheetah-v5"
-env=gym.make(env_name)
+num_envs = 8
+env_name="InvertedDoublePendulum-v5"
+
+env = gym.vector.SyncVectorEnv([lambda: gym.make(env_name) for _ in range(num_envs)])
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
 class obs_normalizer:
     def __init__(self):
         self.k=1e-4
-        self.mean=torch.zeros(env.observation_space.shape).to(device)
-        self.m2=torch.zeros(env.observation_space.shape).to(device)
+        self.mean=torch.zeros(num_envs,env.single_observation_space.shape[0]).to(device)
+        self.m2=torch.zeros(num_envs,env.single_observation_space.shape[0]).to(device)
     def update(self,obs):
         with torch.no_grad():
             self.k+=1
@@ -30,15 +32,15 @@ class Actor(nn.Module):
     def __init__(self):
         super().__init__()
         self.net=nn.Sequential(
-            nn.Linear(env.observation_space.shape[0],512 ),
+            nn.Linear(env.single_observation_space.shape[0],512 ),
             nn.Tanh(),
             nn.Linear(512 ,512 ),
             nn.Tanh(),
             nn.Linear(512 ,512 ),
             nn.Tanh()
             )
-        self.mu_head=nn.Linear(512 ,env.action_space.shape[0])
-        self.log_std = nn.Parameter(torch.zeros(env.action_space.shape[0]))
+        self.mu_head=nn.Linear(512 ,env.single_action_space.shape[0])
+        self.log_std = nn.Parameter(torch.zeros(env.single_action_space.shape[0]))
     def forward(self,x):
         x=self.net(x)
         mu=self.mu_head(x)
@@ -50,7 +52,7 @@ class Critic(nn.Module):
     def __init__(self):
         super().__init__()
         self.net=nn.Sequential(
-            nn.Linear(env.observation_space.shape[0],512 ),
+            nn.Linear(env.single_observation_space.shape[0],512 ),
             nn.ReLU(),
             nn.Linear(512 ,512 ),
             nn.ReLU(),
@@ -59,18 +61,18 @@ class Critic(nn.Module):
     def forward(self,x):
         return self.net(x)
 def compute_advanteges(values,rewards,terminateds,trunkateds,last_value,gamma=0.99,lam=0.95):
-    advanteges=[]
+    rewards = torch.tensor(np.array(rewards), dtype=torch.float32).to(device)
+    advanteges=torch.zeros_like(rewards).to(device)
     advantege=0
     values = torch.cat([values, last_value.unsqueeze(0)])
-    rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
+    terminateds=torch.from_numpy(np.array(terminateds)).to(torch.float32).to(device)
     for t in reversed(range(len(values)-1)):
-        done=float(terminateds[t])
+        done=terminateds[t].float()
         
         delta=rewards[t]+gamma*values[t+1]*(1-done)-values[t]
         advantege=delta+gamma*lam*(1-done)*advantege
-        advanteges.append(advantege)
-    advanteges_tensor = torch.stack(advanteges[::-1])
-    return advanteges_tensor.to(device=device)
+        advanteges[t]=advantege
+    return advanteges
 
 policy=Actor()
 value_func=Critic()
@@ -129,7 +131,7 @@ if  task=="train":
             values=[]
 
             obs,_=env.reset()
-            episode_reward = 0
+            episode_reward=torch.zeros(num_envs,dtype=torch.float32)
             low = torch.tensor(env.action_space.low).to(device)
             high = torch.tensor(env.action_space.high).to(device)
             for i in range(4096):
@@ -154,17 +156,11 @@ if  task=="train":
                     episode_reward+=reward
                     trunkateds.append(truncated)
                     terminateds.append(terminated)
-                    if terminated or truncated:
-                        
-                        episode_count += 1
-                        
-                        obs,_=env.reset()
-                        
-                        if episode_count%20==0:
-                            print(f"Episode {episode_count} reward: {episode_reward}")
-                        episode_reward = 0
 
-
+            episode_count+=1
+            
+            print(f"episode: {episode_count}, reward: {episode_reward.mean()/num_envs}")
+            episode_reward=torch.zeros(num_envs,dtype=torch.float32)
             values = torch.stack(values)
 
             with torch.no_grad():
@@ -173,7 +169,7 @@ if  task=="train":
                 std = torch.sqrt(variance + 1e-8)
                 normed_last_obs = torch.clamp((final_obs_tensor - normilizer.mean) / std, -5, 5)
                 last_value = value_func(normed_last_obs).squeeze()
-
+            
             advantages=compute_advanteges(values,rewards,terminateds,trunkateds,last_value)
             returns = advantages + values
             advantages=(advantages-advantages.mean())/(advantages.std()+1e-8)
