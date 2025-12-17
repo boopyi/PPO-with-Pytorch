@@ -4,7 +4,8 @@ import numpy as np
 
 
 import gymnasium as gym
-env=gym.make("Reacher-v5")
+env_name="Reacher-v5"
+env=gym.make(env_name)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
@@ -110,78 +111,108 @@ def update_policy(states, actions, log_probs_old, returns, advantages,batch_size
             value_optimizer.step()
 
 num_episodes=500
-episode_count = 0
-for _ in range(num_episodes):
-    states=[]
-    actions=[]
-    log_probs=[]
-    rewards=[]
-    terminateds=[]
-    trunkateds=[]
-    values=[]
 
-    obs,_=env.reset()
-    episode_reward = 0
-    low = torch.tensor(env.action_space.low).to(device)
-    high = torch.tensor(env.action_space.high).to(device)
-    for i in range(1024):
-        obs=torch.tensor(obs,dtype=torch.float32).to(device=device)
-        obs=normilizer.update(obs)
-        mu,std=policy.forward(obs)
-        dist=torch.distributions.Normal(mu,std)
-        action=dist.sample()
+task=input("train or test?")
+if  task=="train":
+    episode_count = 0
+    for _ in range(num_episodes):
+        states=[]
+        actions=[]
+        log_probs=[]
+        rewards=[]
+        terminateds=[]
+        trunkateds=[]
+        values=[]
+
+        obs,_=env.reset()
+        episode_reward = 0
+        low = torch.tensor(env.action_space.low).to(device)
+        high = torch.tensor(env.action_space.high).to(device)
+        for i in range(1024):
+            obs=torch.tensor(obs,dtype=torch.float32).to(device=device)
+            obs=normilizer.update(obs)
+            mu,std=policy.forward(obs)
+            dist=torch.distributions.Normal(mu,std)
+            action=dist.sample()
+            
+            
+            log_prob = dist.log_prob(action).sum(dim=-1)
+            value=value_func.forward(obs)
+            states.append(obs)
+            actions.append(action.cpu().numpy())
+            log_probs.append(log_prob.detach())
+            values.append(value.squeeze().detach())
+            action_env = torch.clamp(action, low, high).cpu().numpy()
+            obs, reward, terminated, truncated, _=env.step(action_env)
+            
+            rewards.append(reward)
+            episode_reward+=reward
+            trunkateds.append(truncated)
+            terminateds.append(terminated)
+            if terminated or truncated:
+                
+                episode_count += 1
+                
+                obs,_=env.reset()
+                if episode_count%20==0:
+                    print(f"Episode {episode_count} reward: {episode_reward}")
+                episode_reward = 0
+
+
+        values = torch.stack(values)
+        last_obs_tensor = normilizer.update(torch.tensor(obs, dtype=torch.float32).to(device))
+        with torch.no_grad():
+            last_value = value_func(last_obs_tensor).squeeze()
+
+        advantages=compute_advanteges(values,rewards,terminateds,trunkateds,last_value)
+        returns = advantages + values
+        advantages=(advantages-advantages.mean())/(advantages.std()+1e-8)
+        states=torch.stack(states)
+        actions = torch.from_numpy(np.array(actions)).to(torch.float32).to(device)
+        log_probs=torch.stack(log_probs)
+        policy.to(device)
+        value_func.to(device)
+        states = states.to(device)
+        actions = actions.to(device)
+        log_probs = log_probs.to(device)
+        returns = returns.to(device)
+        advantages = advantages.to(device)
+        advantages = advantages.detach()
+        returns = returns.detach()
+
+
+        update_policy(states,actions,log_probs,returns,advantages)
+    
+    torch.save({
+        'model_state_dict': policy.state_dict(),
+        'obs_mean': normilizer.mean,
+        'obs_m2': normilizer.m2,
+        'obs_k': normilizer.k
+    }, "ppo_pendulum_final.pth")
+elif task=="test":
+    env=gym.make(env_name,render_mode="human")
+    checkpoint = torch.load("ppo_continous_final.pth", map_location=device)
+
+    policy = policy.to(device)
+    policy.load_state_dict(checkpoint['model_state_dict'])
+    policy.eval()
+    normilizer.mean=checkpoint["obs_mean"]
+    normilizer.m2=checkpoint["obs_m2"]
+    normilizer.k=checkpoint["obs_k"]
+    obs, _ = env.reset()
+    
+    for _ in range(1000):
+        obs=torch.tensor(obs,dtype=torch.float32).to(device)
+        norm_obs = normilizer.update(obs)
         
+        with torch.no_grad():
+            # Use mu (mean) for deterministic testing
+            action_tensor,_ = policy(norm_obs)
+            action_numpy = action_tensor.cpu().numpy().flatten()
         
-        log_prob = dist.log_prob(action).sum(dim=-1)
-        value=value_func.forward(obs)
-        states.append(obs)
-        actions.append(action.cpu().numpy())
-        log_probs.append(log_prob.detach())
-        values.append(value.squeeze().detach())
-        action_env = torch.clamp(action, low, high).cpu().numpy()
-        obs, reward, terminated, truncated, _=env.step(action_env)
+        obs, reward, terminated, truncated, _ = env.step(action_numpy)
         
-        rewards.append(reward)
-        episode_reward+=reward
-        trunkateds.append(truncated)
-        terminateds.append(terminated)
         if terminated or truncated:
-            
-            episode_count += 1
-            
-            obs,_=env.reset()
-            if episode_count%20==0:
-                print(f"Episode {episode_count} reward: {episode_reward}")
-            episode_reward = 0
+            obs, _ = env.reset()
 
-
-    values = torch.stack(values)
-    last_obs_tensor = normilizer.update(torch.tensor(obs, dtype=torch.float32).to(device))
-    with torch.no_grad():
-        last_value = value_func(last_obs_tensor).squeeze()
-
-    advantages=compute_advanteges(values,rewards,terminateds,trunkateds,last_value)
-    returns = advantages + values
-    advantages=(advantages-advantages.mean())/(advantages.std()+1e-8)
-    states=torch.stack(states)
-    actions = torch.from_numpy(np.array(actions)).to(torch.float32).to(device)
-    log_probs=torch.stack(log_probs)
-    policy.to(device)
-    value_func.to(device)
-    states = states.to(device)
-    actions = actions.to(device)
-    log_probs = log_probs.to(device)
-    returns = returns.to(device)
-    advantages = advantages.to(device)
-    advantages = advantages.detach()
-    returns = returns.detach()
-
-
-    update_policy(states,actions,log_probs,returns,advantages)
-   
-torch.save({
-    'model_state_dict': policy.state_dict(),
-    'obs_mean': normilizer.mean,
-    'obs_m2': normilizer.m2,
-    'obs_k': normilizer.k
-}, "ppo_pendulum_final.pth")
+    env.close()
