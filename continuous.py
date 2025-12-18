@@ -1,11 +1,11 @@
 import torch
 import torch.nn as nn
 import numpy as np
-
+import time
 
 import gymnasium as gym
-num_envs = 8
-env_name="InvertedDoublePendulum-v5"
+num_envs = 24
+env_name="HalfCheetah-v5"
 
 env = gym.vector.SyncVectorEnv([lambda: gym.make(env_name) for _ in range(num_envs)])
 
@@ -41,10 +41,12 @@ class Actor(nn.Module):
             )
         self.mu_head=nn.Linear(512 ,env.single_action_space.shape[0])
         self.log_std = nn.Parameter(torch.zeros(env.single_action_space.shape[0]))
+        high=torch.tensor(env.single_action_space.high,dtype=torch.float32).to(device)
+        self.register_buffer("high",high)
     def forward(self,x):
         x=self.net(x)
         mu=self.mu_head(x)
-        mu=torch.tanh(mu)*torch.tensor(env.action_space.high).to(device)
+        mu=torch.tanh(mu)*self.high
         std = torch.exp(self.log_std).expand_as(mu)
         
         return mu,std
@@ -82,7 +84,7 @@ policy_optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
 value_optimizer = torch.optim.Adam(value_func.parameters(), lr=1e-3)
 policy.to(device)
 value_func.to(device)
-def update_policy(states, actions, log_probs_old, returns, advantages,batch_size=1024,epochs=10,clip_ratio=0.2,c1=0.5,c2=0.02):
+def update_policy(states, actions, log_probs_old, returns, advantages,batch_size=4096,epochs=10,clip_ratio=0.2,c1=0.5,c2=0.02):
     dataset_size = len(states)
     for _ in range(epochs):
         indices = torch.randperm(dataset_size)
@@ -121,7 +123,9 @@ task=input("train or test?\n")
 if  task=="train":
     try:
         episode_count = 0
+        total_steps = 0
         for _ in range(num_episodes):
+            ep_start_time=time.time()
             states=[]
             actions=[]
             log_probs=[]
@@ -158,8 +162,11 @@ if  task=="train":
                     terminateds.append(terminated)
 
             episode_count+=1
-            
-            print(f"episode: {episode_count}, reward: {episode_reward.mean()/num_envs}")
+            curr_steps=4096*num_envs
+            total_steps+=curr_steps
+            ep_end_time=time.time()
+            sps=curr_steps/(ep_end_time-ep_start_time)
+            print(f"episode: {episode_count}, steps: {total_steps}, sps: {sps}, reward: {episode_reward.mean()}")
             episode_reward=torch.zeros(num_envs,dtype=torch.float32)
             values = torch.stack(values)
 
@@ -187,6 +194,12 @@ if  task=="train":
             returns = returns.detach()
 
 
+            states = states.view(-1, env.single_observation_space.shape[0])
+            actions = actions.view(-1, env.single_action_space.shape[0])
+            log_probs = log_probs.view(-1)
+            returns = returns.view(-1)
+            advantages = advantages.view(-1)
+
             update_policy(states,actions,log_probs,returns,advantages)
         
         torch.save({
@@ -211,15 +224,18 @@ elif task=="test":
     policy = policy.to(device)
     policy.load_state_dict(checkpoint['model_state_dict'])
     policy.eval()
-    mean=checkpoint["obs_mean"]
-    m2=checkpoint["obs_m2"]
+    mean=checkpoint["obs_mean"][0]
+    m2=checkpoint["obs_m2"][0]
     k=checkpoint["obs_k"]
     variance=m2/k
     std=torch.sqrt(variance+1e-8)
+    if std.dim() > 1:
+        std = std[0]
     obs, _ = env.reset()
 
     
     for _ in range(1000):
+        time.sleep(0.01)
         obs=torch.tensor(obs,dtype=torch.float32).to(device)
         norm_obs=(obs-mean)/std
         norm_obs=torch.clamp(norm_obs, -5, 5)
