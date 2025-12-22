@@ -152,10 +152,10 @@ if  task=="train":
 
 
         update_policy(states,actions,log_probs,returns,advantages)  
-    torch.save(policy.state_dict(), "ppo_discrete_final.pth")
+    torch.save(policy.state_dict(), r"C:\Users\User\Desktop\vs_code_projects\learn-ppo\models\ppo_discrete_final.pth")
 elif task=="test":
     env=gym.make(env_name,render_mode="human")
-    state_dict=torch.load("ppo_discrete_final.pth")
+    state_dict=torch.load(r"C:\Users\User\Desktop\vs_code_projects\learn-ppo\models\ppo_discrete_final.pth")
     policy.load_state_dict(state_dict)
     policy.eval()
     obs, _ = env.reset()
