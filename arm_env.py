@@ -17,7 +17,7 @@ class Env(gym.Env):
     def __init__(self,render_mode="none"):
         super().__init__()
         self.joint_indices = [0, 1, 2, 3]
-        
+        self.max_vel=40
    
         self.ll = np.array([-3.1416, -1.5708, -1.0, 0.0])
         self.ul = np.array([3.1416, 1.5708, 3.1416, 1.5])
@@ -31,13 +31,15 @@ class Env(gym.Env):
         urdf_path = r"C:\Users\User\Desktop\roarm_description\urdf\roarm_description.urdf"
         
         self.observation_space = spaces.Dict({
-            "obs": spaces.Box(low=-np.inf, high=np.inf, shape=(8,), dtype=np.float32),
-            "image": spaces.Box(low=0, high=1, shape=(4, 64, 64), dtype=np.uint8)
-        })
-        self.robot_id=p.loadURDF(urdf_path,useFixedBase=True,physicsClientId=self.client,flags=p.URDF_MAINTAIN_LINK_ORDER)
+            "obs": spaces.Box(low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32),
+            "image": spaces.Box(low=-np.inf, high=np.inf, shape=(4,64,64), dtype=np.float32)
+            })
+        
+        self.robot_id=p.loadURDF(urdf_path,useFixedBase=True,physicsClientId=self.client,flags=p.URDF_MAINTAIN_LINK_ORDER | p.URDF_USE_SELF_COLLISION)
         self.point_vis=p.createVisualShape(p.GEOM_SPHERE,0.04,rgbaColor=[1,0,0,1],physicsClientId=self.client)
         self.point=p.createMultiBody(0.1,baseVisualShapeIndex=self.point_vis,basePosition=[0,0,0],physicsClientId=self.client)
         self.camera_idx = -1
+        
         for i in range(p.getNumJoints(self.robot_id,self.client)):
             joint_info = p.getJointInfo(self.robot_id, i,physicsClientId=self.client)
             if joint_info[12].decode('utf-8') == "camera_link":
@@ -53,14 +55,11 @@ class Env(gym.Env):
                      jointDamping=0.5)
         
         p.setAdditionalSearchPath(os.path.dirname(__file__))
+
         p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0, physicsClientId=self.client) 
-        
         p.configureDebugVisualizer(p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW, 0, physicsClientId=self.client)
         p.configureDebugVisualizer(p.COV_ENABLE_DEPTH_BUFFER_PREVIEW, 0, physicsClientId=self.client)
-
-        
         p.configureDebugVisualizer(p.COV_ENABLE_KEYBOARD_SHORTCUTS, 0, physicsClientId=self.client)
-        
         p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1, physicsClientId=self.client)
         
         if render_mode=="human":
@@ -79,19 +78,21 @@ class Env(gym.Env):
             p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0, physicsClientId=self.client)
             p.configureDebugVisualizer(p.COV_ENABLE_WIREFRAME, 0, physicsClientId=self.client)
         self.prev_hand_pos= p.getLinkState(self.robot_id, self.hand_idx)[0]
-        self.collision_dist=0.14
+        self.collision_dist=0.13
         
     def get_obs(self):
-        obs=np.zeros((8,),dtype=np.float32)
+        obs=np.zeros((9,),dtype=np.float32)
         for i in range(p.getNumJoints(self.robot_id,physicsClientId=self.client)-3):
-            obs[i]=p.getJointState(self.robot_id,i,physicsClientId=self.client)[0]
-            obs[i+4]=p.getJointState(self.robot_id,i,physicsClientId=self.client)[1]
-            
-        total_obs={
+            obs[i]=p.getJointState(self.robot_id,i,physicsClientId=self.client)[0]/np.pi
+            obs[i+4]=p.getJointState(self.robot_id,i,physicsClientId=self.client)[1]/self.max_vel
+        obs[8]=self.get_num_of_ball_pixels()/(64*64)
+        img_stack = np.stack(self.frame_stack, axis=0).astype(np.float32)
+        img_stack /= 255.0
+        obs={
             "obs": obs,
-            "image": np.concatenate(list(self.frame_stack), axis=0)
+            "image": img_stack
         }
-        return total_obs
+        return obs
         
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -113,36 +114,47 @@ class Env(gym.Env):
             forward_vec = np.array([rot_mat[2], rot_mat[5], rot_mat[8]])
             spawn_pos = np.array(pos_cam) + (forward_vec * 0.25) + np.random.uniform(-0.1, 0.1, 3)
             
+        if np.random.random()<0.33:
+            spawn_pos=np.array((99999, 9999, 999999))
+            while self.is_out_of_bounds(spawn_pos):
+                spawn_pos=np.random.uniform([-0.3,-0.3,0], [0.3,0.3,0.3], 3)
         p.resetBasePositionAndOrientation(self.point, spawn_pos, [0,0,0,1], self.client)
  
     
         self.target_pos=spawn_pos
        
         img = self.get_image()
-
-        red_channel = img[0, :, :, 0] 
-        green_channel = img[0, :, :, 1] 
-        binary_frame = ((red_channel > 150) & (green_channel < 20)).astype(np.uint8)
-
+        img = img[0, :, :, :3]
+        gray = ((img[:, :, 0] > 150) & (img[:, :, 1] < 20)).astype(np.uint8) * 255
         self.frame_stack.clear()
         for _ in range(4):
-            self.frame_stack.append(binary_frame[np.newaxis, :, :])
+            self.frame_stack.append(gray)
             
         self.prev_hand_pos = p.getLinkState(self.robot_id, self.hand_idx)[0]
         return self.get_obs(), {}
     def step(self,action):
+        self.steps_since_reset+=1
         
         self.prev_hand_pos= p.getLinkState(self.robot_id, self.hand_idx)[0]
-        current_joint_states = p.getJointStates(self.robot_id, self.joint_indices)
-        current_pos = np.array([state[0] for state in current_joint_states])
-        new_pos = current_pos + (action * 0.2)
-        self.final_pos = np.clip(new_pos, self.ll, self.ul)
+
+        self.max_vel
+        force=30
+
+        target_vel = np.clip(action * self.max_vel,
+                     -self.max_vel, self.max_vel)
+
+        current_positions = np.array([p.getJointState(self.robot_id, i)[0] 
+                                    for i in self.joint_indices])
+        for i in range(len(self.joint_indices)):
+            if (current_positions[i] <= self.ll[i] and target_vel[i] < 0) or \
+            (current_positions[i] >= self.ul[i] and target_vel[i] > 0):
+                target_vel[i] = 0
         p.setJointMotorControlArray(
-            self.robot_id, 
-            self.joint_indices, 
-            p.POSITION_CONTROL, 
-            targetPositions=self.final_pos,
-            forces=[5.0]*4,
+            self.robot_id,
+            self.joint_indices,
+            p.VELOCITY_CONTROL,
+            targetVelocities=target_vel,
+            forces=[force]*len(self.joint_indices),
             physicsClientId=self.client
         )
         
@@ -150,12 +162,12 @@ class Env(gym.Env):
         
         if self.render_mode=="human":
             
-            for _ in range(15):
-                time.sleep(1/(60*15))
+            for _ in range(8):
+                time.sleep(1/(60*8))
                 p.stepSimulation(self.client)
             
         else:
-            for _ in range(15):
+            for _ in range(8):
                 p.stepSimulation(self.client)
        
         hand_pos = p.getLinkState(self.robot_id, self.hand_idx)[0]
@@ -173,30 +185,33 @@ class Env(gym.Env):
         red_pixels = np.sum((red_channel > 100) & (green_channel<50))
         black_pixels=np.sum((red_channel <50) & (green_channel<50))
         if red_pixels>0 and self.render_mode=="human":
-            print(np.clip(red_pixels / 100, 0, 2))
+            #print(red_pixels/(64*64)*100)
+            pass
         if black_pixels>0 and self.render_mode=="human":
             print(11111111111111111111111111111111111)
 
         
-        
-        self.frame_stack.append(((red_channel > 150) & (green_channel<20))[np.newaxis, :, :].astype(np.uint8))
+        gray = img[0, :, :, :3]
+        gray = ((gray[:, :, 0] > 150) & (gray[:, :, 1] < 20)).astype(np.uint8) * 255
+        self.frame_stack.append(gray)
         terminated=curr_dist<self.collision_dist
-        #Image.fromarray(self.frame_stack[-1][0,:,:]).save("binary.png")
-        dist_reward = (prev_dist**2 - curr_dist**2) * 50.0
+
+
 
        
-        reward = dist_reward
-        reward += (red_pixels / 100.0)
-        reward-=black_pixels/100
+        reward = 0
+        reward += np.clip(red_pixels / (64*64), 0.0, 0.05)
+        reward-=np.clip(black_pixels / (64*64), 0.0, 0.05)
 
-        reward -= 0.2  
+        if curr_dist < 0.25:
+            reward += 3 
         if curr_dist < 0.15:
-            reward += 0.5 
-        if curr_dist < 0.10:
-            reward += 1.0
+            reward += 6
         if terminated:
             reward += 500.0 
         truncated=self.steps_since_reset>500
+        if truncated:
+            reward-=500.0
 
         return self.get_obs(), reward, terminated, truncated, {}
     def get_image(self):
@@ -215,19 +230,19 @@ class Env(gym.Env):
             physicsClientId=self.client
         )
         proj_matrix = p.computeProjectionMatrixFOV(
-            fov=110, aspect=1, nearVal=0.01, farVal=5.0, physicsClientId=self.client
+            fov=68.5, aspect=1, nearVal=0.01, farVal=5.0, physicsClientId=self.client
         )
         (_, _, rgb, _, _) = p.getCameraImage(
             width=64, height=64,
             viewMatrix=view_matrix,
             projectionMatrix=proj_matrix,
-            renderer=p.ER_TINY_RENDERER,
-            flags=p.ER_NO_SEGMENTATION_MASK,
+            renderer=p.ER_BULLET_HARDWARE_OPENGL,
+            flags=p.ER_NO_SEGMENTATION_MASK | p.ER_USE_PROJECTIVE_TEXTURE,
             physicsClientId=self.client
         )
-        
-        p.addUserDebugLine(pos, target, [1, 1, 0], lineWidth=2, lifeTime=0.1)
-        p.addUserDebugLine(pos, up, [0, 1, 0], lineWidth=2, lifeTime=0.1)
+        if self.render_mode == "human":
+            p.addUserDebugLine(pos, target, [1, 1, 0], lineWidth=2, lifeTime=0.1)
+            p.addUserDebugLine(pos, up, [0, 1, 0], lineWidth=2, lifeTime=0.1)
         rgb = np.array(rgb, dtype=np.uint8).reshape(64, 64, 4)
         
          
@@ -278,7 +293,6 @@ if __name__ == '__main__':
         
 
         obs, reward, terminated, truncated, _ = env.step(action_clipped)
-        image=obs["image"]
         
         
         
